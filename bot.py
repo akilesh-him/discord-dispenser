@@ -14,9 +14,9 @@ DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 TEST_GUILD_ID = 1550297120601542776
 
 DAILY_PULL_LIMIT = 2
-IMPORT_PASSWORD = os.environ.get("IMPORT_PASSWORD", "changeme123")  # set in Render env vars!
+IMPORT_PASSWORD = os.environ.get("IMPORT_PASSWORD", "changeme123")
 
-URL_REGEX = re.compile(r"https?://[^\s<>]+")
+URL_REGEX = re.compile(r"https?://[^\s<>\)\]]+")
 
 
 # ---------- PERSISTENCE ----------
@@ -41,13 +41,6 @@ def get_guild_config(guild_id: int) -> dict:
             "panel_channel": None,
             "panel_message": None,
             "links": [],
-            # user_state: {
-            #   "<user_id>": {
-            #       "day": "YYYY-MM-DD",
-            #       "pull_count": int,
-            #       "seen_urls": [url, ...]
-            #   }
-            # }
             "user_state": {},
         }
     cfg = data["guilds"][gid]
@@ -246,7 +239,6 @@ async def on_message(message: discord.Message):
         return
     links = cfg["links"]
     for url in found:
-        # No dedup — every URL is stored, even repeats.
         links.append({
             "url": url,
             "author_id": message.author.id,
@@ -331,7 +323,49 @@ async def setup_clear(interaction: discord.Interaction):
     )
 
 
-# ---------- IMPORT COMMAND ----------
+# ---------- ADD LINKS (paste blob) ----------
+@setup_group.command(
+    name="addlinks",
+    description="Paste a blob of text — every URL in it gets added to the pool",
+)
+@app_commands.describe(
+    text="Paste anything containing URLs (one per line, sentences, whatever)",
+)
+async def setup_addlinks(interaction: discord.Interaction, text: str):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+
+    matches = URL_REGEX.findall(text)
+    if not matches:
+        await interaction.response.send_message(
+            "❌ No URLs found in that text.", ephemeral=True
+        )
+        return
+
+    cfg = get_guild_config(interaction.guild.id)
+    links = cfg["links"]
+
+    added = 0
+    for url in matches:
+        links.append({
+            "url": url,
+            "author_id": interaction.user.id,
+            "author": f"added by {interaction.user}",
+            "message_id": 0,
+        })
+        added += 1
+
+    save_data(data)
+    await refresh_panel(interaction.guild)
+
+    await interaction.response.send_message(
+        f"✅ Added **{added}** link(s). Total pool now: **{len(links)}**",
+        ephemeral=True,
+    )
+
+
+# ---------- IMPORT COMMAND (kept as a backup) ----------
 @setup_group.command(name="import", description="Import links from a .txt file (one URL per line)")
 @app_commands.describe(
     file="A .txt file with one URL per line",
@@ -375,127 +409,20 @@ async def setup_import(
     links = cfg["links"]
 
     added = 0
-    invalid = 0
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        matches = URL_REGEX.findall(line)
-        if not matches:
-            invalid += 1
-            continue
-        for url in matches:
-            links.append({
-                "url": url,
-                "author_id": interaction.user.id,
-                "author": f"imported by {interaction.user}",
-                "message_id": 0,
-            })
-            added += 1
+    for url in URL_REGEX.findall(text):
+        links.append({
+            "url": url,
+            "author_id": interaction.user.id,
+            "author": f"imported by {interaction.user}",
+            "message_id": 0,
+        })
+        added += 1
 
     save_data(data)
     await refresh_panel(interaction.guild)
 
     await interaction.followup.send(
-        f"✅ Import complete.\n"
-        f"• Added: **{added}**\n"
-        f"• Invalid lines: **{invalid}**\n"
-        f"• Total pool now: **{len(links)}**",
-        ephemeral=True,
-    )
-
-
-# ---------- BACKFILL COMMAND ----------
-@setup_group.command(
-    name="backfill",
-    description="Scan the source channel's history and import all links found",
-)
-@app_commands.describe(
-    password="Import password",
-    limit="How many recent messages to scan (default 10000, max 100000)",
-)
-async def setup_backfill(
-    interaction: discord.Interaction,
-    password: str,
-    limit: int = 10000,
-):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this in a server.", ephemeral=True)
-        return
-
-    if password != IMPORT_PASSWORD:
-        await interaction.response.send_message("❌ Wrong password.", ephemeral=True)
-        return
-
-    cfg = get_guild_config(interaction.guild.id)
-    source_id = cfg.get("source_channel")
-    if not source_id:
-        await interaction.response.send_message(
-            "❌ No source channel set. Run `/setup source` first.", ephemeral=True
-        )
-        return
-
-    channel = interaction.guild.get_channel(source_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(source_id)
-        except discord.HTTPException:
-            await interaction.response.send_message(
-                "❌ Could not access the source channel.", ephemeral=True
-            )
-            return
-
-    limit = max(1, min(limit, 100000))
-
-    await interaction.response.defer(ephemeral=True)
-
-    links = cfg["links"]
-
-    scanned = 0
-    added = 0
-
-    try:
-        async for msg in channel.history(limit=limit, oldest_first=False):
-            scanned += 1
-
-            if msg.author.bot:
-                continue
-
-            found = URL_REGEX.findall(msg.content)
-            if not found:
-                for emb in msg.embeds:
-                    if emb.url:
-                        found.append(emb.url)
-                if not found:
-                    continue
-
-            for url in found:
-                links.append({
-                    "url": url,
-                    "author_id": msg.author.id,
-                    "author": str(msg.author),
-                    "message_id": msg.id,
-                })
-                added += 1
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "❌ Missing permission to read message history in the source channel.",
-            ephemeral=True,
-        )
-        return
-    except Exception as e:
-        await interaction.followup.send(f"❌ Backfill failed: `{e}`", ephemeral=True)
-        return
-
-    save_data(data)
-    await refresh_panel(interaction.guild)
-
-    await interaction.followup.send(
-        f"✅ Backfill complete.\n"
-        f"• Messages scanned: **{scanned}**\n"
-        f"• Added: **{added}**\n"
-        f"• Total pool now: **{len(links)}**",
+        f"✅ Import complete. Added **{added}**. Total pool now: **{len(links)}**",
         ephemeral=True,
     )
 
