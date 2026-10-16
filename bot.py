@@ -10,6 +10,7 @@ from aiohttp import web
 # ---------- CONFIG ----------
 TOKEN = os.environ["DISCORD_TOKEN"]
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
+TEST_GUILD_ID = 1550297120601542776  # your server — commands sync here instantly
 
 URL_REGEX = re.compile(r"https?://[^\s<>]+")
 
@@ -58,7 +59,7 @@ async def start_webserver():
     app.router.add_get("/", health)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 10000))  # Render default is 10000
+    port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"[health] listening on 0.0.0.0:{port}")
@@ -150,9 +151,13 @@ async def on_ready():
         bot._webserver_started = True
 
     print(f"Logged in as {bot.user}")
+
+    # Instant sync to your test guild
+    guild = discord.Object(id=TEST_GUILD_ID)
+    bot.tree.copy_global_to(guild=guild)
     try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
+        synced = await bot.tree.sync(guild=guild)
+        print(f"Synced {len(synced)} slash command(s) to guild {TEST_GUILD_ID}")
     except Exception as e:
         print(f"Slash sync failed: {e}")
 
@@ -253,6 +258,10 @@ async def setup_clear(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await refresh_panel(interaction.guild)
     await interaction.followup.send("🗑️ Cleared all links.", ephemeral=True)
+
+
+# Register the setup group on the tree
+tree.add_command(setup_group)
 
 
 # ---------- RUN ----------
