@@ -91,15 +91,32 @@ def extract_urls(text: str) -> list[str]:
     return urls
 
 
+def message_urls(message: discord.Message) -> list[str]:
+    """URLs from a message's text AND its embeds (bots often post links inside embeds)."""
+    parts = [message.content or ""]
+    for e in message.embeds:
+        for text in (e.url, e.title, e.description):
+            if text:
+                parts.append(text)
+        for f in e.fields:
+            if f.value:
+                parts.append(f.value)
+    return extract_urls("\n".join(parts))
+
+
+def _norm(url: str) -> str:
+    return url.rstrip("/")
+
+
 def add_links(cfg: dict, urls: list[str], author_id: int, author: str, message_id: int = 0) -> int:
     """Adds URLs that aren't already in the pool. Returns how many were actually new."""
     links = cfg["links"]
-    existing = {l["url"] for l in links}
+    existing = {_norm(l["url"]) for l in links}
     added = 0
     for url in urls:
-        if url in existing:
+        if _norm(url) in existing:
             continue
-        existing.add(url)
+        existing.add(_norm(url))
         links.append({
             "url": url,
             "author_id": author_id,
@@ -275,12 +292,12 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
+    if not message.guild or message.author.id == bot.user.id:
         return
     cfg = get_guild_config(message.guild.id)
     if cfg.get("source_channel") != message.channel.id:
         return
-    urls = extract_urls(message.content)
+    urls = message_urls(message)
     if not urls:
         return
     added = add_links(cfg, urls, message.author.id, str(message.author), message.id)
@@ -404,13 +421,19 @@ async def setup_scan(
     scanned = 0
     found = 0
     added = 0
+    from_bots = 0
+    unreadable = 0
     try:
         async for message in channel.history(limit=limit or None, oldest_first=True):
             scanned += 1
-            if message.author.bot:
+            if message.author.id == bot.user.id:
                 continue
-            urls = extract_urls(message.content)
+            if message.author.bot:
+                from_bots += 1
+            urls = message_urls(message)
             if not urls:
+                if not message.content and not message.embeds:
+                    unreadable += 1
                 continue
             found += len(urls)
             added += add_links(cfg, urls, message.author.id, str(message.author), message.id)
@@ -435,8 +458,14 @@ async def setup_scan(
     result = (
         f"✅ Scanned **{scanned}** message(s) in {channel.mention}.\n"
         f"Links found: **{found}** | New: **{added}** | Already stored: **{found - added}**\n"
-        f"Total pool now: **{len(cfg['links'])}**"
+        f"Total pool now: **{len(cfg['links'])}**\n"
+        f"Messages from other bots (included): **{from_bots}**"
     )
+    if unreadable:
+        result += (
+            f"\n⚠️ **{unreadable}** message(s) had no readable text. If that's a lot, check that "
+            "**Message Content Intent** is on in the developer portal (or they may just be images/files)."
+        )
     try:
         await interaction.followup.send(result, ephemeral=True)
     except discord.HTTPException:
