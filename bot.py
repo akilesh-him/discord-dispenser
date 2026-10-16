@@ -60,10 +60,7 @@ def today_utc() -> str:
 
 
 def get_user_state(cfg: dict, user_id: int) -> dict:
-    """
-    Get a user's state, resetting only the DAILY counter on a new day.
-    `seen_urls` persists forever (per user).
-    """
+    """Get a user's state. Daily counter resets on a new day; seen_urls persists forever."""
     uid = str(user_id)
     today = today_utc()
     state = cfg["user_state"].get(uid)
@@ -73,10 +70,8 @@ def get_user_state(cfg: dict, user_id: int) -> dict:
         cfg["user_state"][uid] = state
         return state
 
-    # Migration: old saves won't have seen_urls
     state.setdefault("seen_urls", [])
 
-    # New day → reset pull count, keep seen_urls
     if state.get("day") != today:
         state["day"] = today
         state["pull_count"] = 0
@@ -150,7 +145,6 @@ class PanelView(discord.ui.View):
         user_id = interaction.user.id
         state = get_user_state(cfg, user_id)
 
-        # Daily limit check
         if state["pull_count"] >= DAILY_PULL_LIMIT:
             await interaction.response.send_message(
                 f"⏳ You've hit your daily limit of **{DAILY_PULL_LIMIT}** links. "
@@ -159,12 +153,10 @@ class PanelView(discord.ui.View):
             )
             return
 
-        # Permanent no-repeat per user
         seen = set(state["seen_urls"])
         available = [l for l in links if l["url"] not in seen]
 
         if not available:
-            # This user has already received EVERY link in the pool.
             await interaction.response.send_message(
                 "🎉 You've already received every link in the pool! "
                 "Wait for new links to be added.",
@@ -174,7 +166,6 @@ class PanelView(discord.ui.View):
 
         entry = random.choice(available)
 
-        # Persist the pull
         state["pull_count"] += 1
         state["seen_urls"].append(entry["url"])
         save_data(data)
@@ -370,7 +361,7 @@ async def setup_import(
         )
         return
 
-    if file.size > 2 * 1024 * 1024:  # 2 MB safety cap
+    if file.size > 2 * 1024 * 1024:
         await interaction.response.send_message(
             "❌ File too large (max 2 MB).", ephemeral=True
         )
@@ -397,7 +388,6 @@ async def setup_import(
         line = line.strip()
         if not line:
             continue
-        # Extract any URL(s) on the line; keeps only valid http(s) URLs
         matches = URL_REGEX.findall(line)
         if not matches:
             invalid += 1
@@ -423,6 +413,108 @@ async def setup_import(
         f"• Added: **{added}**\n"
         f"• Duplicates skipped: **{duplicates}**\n"
         f"• Invalid lines: **{invalid}**\n"
+        f"• Total pool now: **{len(links)}**",
+        ephemeral=True,
+    )
+
+
+# ---------- BACKFILL COMMAND ----------
+@setup_group.command(
+    name="backfill",
+    description="Scan the source channel's history and import all links found",
+)
+@app_commands.describe(
+    password="Import password",
+    limit="How many recent messages to scan (default 10000, max 100000)",
+)
+async def setup_backfill(
+    interaction: discord.Interaction,
+    password: str,
+    limit: int = 10000,
+):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+
+    if password != IMPORT_PASSWORD:
+        await interaction.response.send_message("❌ Wrong password.", ephemeral=True)
+        return
+
+    cfg = get_guild_config(interaction.guild.id)
+    source_id = cfg.get("source_channel")
+    if not source_id:
+        await interaction.response.send_message(
+            "❌ No source channel set. Run `/setup source` first.", ephemeral=True
+        )
+        return
+
+    channel = interaction.guild.get_channel(source_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(source_id)
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "❌ Could not access the source channel.", ephemeral=True
+            )
+            return
+
+    limit = max(1, min(limit, 100000))
+
+    await interaction.response.defer(ephemeral=True)
+
+    links = cfg["links"]
+    existing = {l["url"] for l in links}
+
+    scanned = 0
+    added = 0
+    duplicates = 0
+
+    try:
+        async for msg in channel.history(limit=limit, oldest_first=False):
+            scanned += 1
+
+            if msg.author.bot:
+                continue
+
+            found = URL_REGEX.findall(msg.content)
+            if not found:
+                # also check embeds (sometimes URLs live in embeds only)
+                for emb in msg.embeds:
+                    if emb.url:
+                        found.append(emb.url)
+                if not found:
+                    continue
+
+            for url in found:
+                if url in existing:
+                    duplicates += 1
+                    continue
+                links.append({
+                    "url": url,
+                    "author_id": msg.author.id,
+                    "author": str(msg.author),
+                    "message_id": msg.id,
+                })
+                existing.add(url)
+                added += 1
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ Missing permission to read message history in the source channel.",
+            ephemeral=True,
+        )
+        return
+    except Exception as e:
+        await interaction.followup.send(f"❌ Backfill failed: `{e}`", ephemeral=True)
+        return
+
+    save_data(data)
+    await refresh_panel(interaction.guild)
+
+    await interaction.followup.send(
+        f"✅ Backfill complete.\n"
+        f"• Messages scanned: **{scanned}**\n"
+        f"• Added: **{added}**\n"
+        f"• Duplicates skipped: **{duplicates}**\n"
         f"• Total pool now: **{len(links)}**",
         ephemeral=True,
     )
