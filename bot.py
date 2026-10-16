@@ -43,9 +43,9 @@ def get_guild_config(guild_id: int) -> dict:
             "links": [],
             # user_state: {
             #   "<user_id>": {
-            #       "day": "YYYY-MM-DD",        # today's UTC date
-            #       "pull_count": int,          # pulls used today
-            #       "seen_urls": [url, ...]     # ALL URLs this user has EVER received
+            #       "day": "YYYY-MM-DD",
+            #       "pull_count": int,
+            #       "seen_urls": [url, ...]
             #   }
             # }
             "user_state": {},
@@ -60,7 +60,6 @@ def today_utc() -> str:
 
 
 def get_user_state(cfg: dict, user_id: int) -> dict:
-    """Get a user's state. Daily counter resets on a new day; seen_urls persists forever."""
     uid = str(user_id)
     today = today_utc()
     state = cfg["user_state"].get(uid)
@@ -246,24 +245,20 @@ async def on_message(message: discord.Message):
     if not found:
         return
     links = cfg["links"]
-    added = False
     for url in found:
-        if any(l["url"] == url for l in links):
-            continue
+        # No dedup — every URL is stored, even repeats.
         links.append({
             "url": url,
             "author_id": message.author.id,
             "author": str(message.author),
             "message_id": message.id,
         })
-        added = True
-    if added:
-        save_data(data)
-        await refresh_panel(message.guild)
-        try:
-            await message.add_reaction("📎")
-        except discord.HTTPException:
-            pass
+    save_data(data)
+    await refresh_panel(message.guild)
+    try:
+        await message.add_reaction("📎")
+    except discord.HTTPException:
+        pass
 
 
 # ---------- SETUP GROUP ----------
@@ -378,10 +373,8 @@ async def setup_import(
 
     cfg = get_guild_config(interaction.guild.id)
     links = cfg["links"]
-    existing = {l["url"] for l in links}
 
     added = 0
-    duplicates = 0
     invalid = 0
 
     for line in text.splitlines():
@@ -393,16 +386,12 @@ async def setup_import(
             invalid += 1
             continue
         for url in matches:
-            if url in existing:
-                duplicates += 1
-                continue
             links.append({
                 "url": url,
                 "author_id": interaction.user.id,
                 "author": f"imported by {interaction.user}",
                 "message_id": 0,
             })
-            existing.add(url)
             added += 1
 
     save_data(data)
@@ -411,7 +400,6 @@ async def setup_import(
     await interaction.followup.send(
         f"✅ Import complete.\n"
         f"• Added: **{added}**\n"
-        f"• Duplicates skipped: **{duplicates}**\n"
         f"• Invalid lines: **{invalid}**\n"
         f"• Total pool now: **{len(links)}**",
         ephemeral=True,
@@ -463,11 +451,9 @@ async def setup_backfill(
     await interaction.response.defer(ephemeral=True)
 
     links = cfg["links"]
-    existing = {l["url"] for l in links}
 
     scanned = 0
     added = 0
-    duplicates = 0
 
     try:
         async for msg in channel.history(limit=limit, oldest_first=False):
@@ -478,7 +464,6 @@ async def setup_backfill(
 
             found = URL_REGEX.findall(msg.content)
             if not found:
-                # also check embeds (sometimes URLs live in embeds only)
                 for emb in msg.embeds:
                     if emb.url:
                         found.append(emb.url)
@@ -486,16 +471,12 @@ async def setup_backfill(
                     continue
 
             for url in found:
-                if url in existing:
-                    duplicates += 1
-                    continue
                 links.append({
                     "url": url,
                     "author_id": msg.author.id,
                     "author": str(msg.author),
                     "message_id": msg.id,
                 })
-                existing.add(url)
                 added += 1
     except discord.Forbidden:
         await interaction.followup.send(
@@ -514,7 +495,6 @@ async def setup_backfill(
         f"✅ Backfill complete.\n"
         f"• Messages scanned: **{scanned}**\n"
         f"• Added: **{added}**\n"
-        f"• Duplicates skipped: **{duplicates}**\n"
         f"• Total pool now: **{len(links)}**",
         ephemeral=True,
     )
