@@ -2,6 +2,7 @@ import os
 import re
 import json
 import random
+import datetime
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -10,9 +11,13 @@ from aiohttp import web
 # ---------- CONFIG ----------
 TOKEN = os.environ["DISCORD_TOKEN"]
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
-TEST_GUILD_ID = 1550297120601542776  # your server — commands sync here instantly
+TEST_GUILD_ID = 1550297120601542776
+
+DAILY_PULL_LIMIT = 2
+IMPORT_PASSWORD = os.environ.get("IMPORT_PASSWORD", "changeme123")  # set in Render env vars!
 
 URL_REGEX = re.compile(r"https?://[^\s<>]+")
+
 
 # ---------- PERSISTENCE ----------
 def load_data():
@@ -36,8 +41,47 @@ def get_guild_config(guild_id: int) -> dict:
             "panel_channel": None,
             "panel_message": None,
             "links": [],
+            # user_state: {
+            #   "<user_id>": {
+            #       "day": "YYYY-MM-DD",        # today's UTC date
+            #       "pull_count": int,          # pulls used today
+            #       "seen_urls": [url, ...]     # ALL URLs this user has EVER received
+            #   }
+            # }
+            "user_state": {},
         }
-    return data["guilds"][gid]
+    cfg = data["guilds"][gid]
+    cfg.setdefault("user_state", {})
+    return cfg
+
+
+def today_utc() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def get_user_state(cfg: dict, user_id: int) -> dict:
+    """
+    Get a user's state, resetting only the DAILY counter on a new day.
+    `seen_urls` persists forever (per user).
+    """
+    uid = str(user_id)
+    today = today_utc()
+    state = cfg["user_state"].get(uid)
+
+    if state is None:
+        state = {"day": today, "pull_count": 0, "seen_urls": []}
+        cfg["user_state"][uid] = state
+        return state
+
+    # Migration: old saves won't have seen_urls
+    state.setdefault("seen_urls", [])
+
+    # New day → reset pull count, keep seen_urls
+    if state.get("day") != today:
+        state["day"] = today
+        state["pull_count"] = 0
+
+    return state
 
 
 # ---------- BOT ----------
@@ -50,7 +94,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 
-# ---------- HEALTH SERVER (for Render) ----------
+# ---------- HEALTH SERVER ----------
 async def health(request):
     return web.Response(text="OK")
 
@@ -77,6 +121,7 @@ def build_panel_embed(guild_id: int) -> discord.Embed:
         color=discord.Color.blurple(),
     )
     embed.add_field(name="Links available", value=str(len(links)), inline=True)
+    embed.add_field(name="Daily limit", value=f"{DAILY_PULL_LIMIT} pulls / user", inline=True)
     embed.set_footer(text="One button. Infinite(ish) links.")
     return embed
 
@@ -95,17 +140,56 @@ class PanelView(discord.ui.View):
         if not interaction.guild:
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
-        links = get_guild_config(interaction.guild.id)["links"]
+
+        cfg = get_guild_config(interaction.guild.id)
+        links = cfg["links"]
         if not links:
             await interaction.response.send_message("📭 No links yet!", ephemeral=True)
             return
-        entry = random.choice(links)
+
+        user_id = interaction.user.id
+        state = get_user_state(cfg, user_id)
+
+        # Daily limit check
+        if state["pull_count"] >= DAILY_PULL_LIMIT:
+            await interaction.response.send_message(
+                f"⏳ You've hit your daily limit of **{DAILY_PULL_LIMIT}** links. "
+                "Come back tomorrow (UTC).",
+                ephemeral=True,
+            )
+            return
+
+        # Permanent no-repeat per user
+        seen = set(state["seen_urls"])
+        available = [l for l in links if l["url"] not in seen]
+
+        if not available:
+            # This user has already received EVERY link in the pool.
+            await interaction.response.send_message(
+                "🎉 You've already received every link in the pool! "
+                "Wait for new links to be added.",
+                ephemeral=True,
+            )
+            return
+
+        entry = random.choice(available)
+
+        # Persist the pull
+        state["pull_count"] += 1
+        state["seen_urls"].append(entry["url"])
+        save_data(data)
+
+        remaining = DAILY_PULL_LIMIT - state["pull_count"]
+
         embed = discord.Embed(
             title="🎲 Your random link",
-            description=f"[{entry['url']}]({entry['url']})",
+            description=f"<{entry['url']}>",
             color=discord.Color.green(),
         )
-        embed.set_footer(text=f"Originally shared by {entry['author']}")
+        embed.set_footer(
+            text=f"Originally shared by {entry['author']} • "
+                 f"{remaining} pull(s) left today"
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -145,14 +229,12 @@ async def refresh_panel(guild: discord.Guild) -> discord.Message | None:
 async def on_ready():
     bot.add_view(PanelView())
 
-    # Start health server exactly once
     if not getattr(bot, "_webserver_started", False):
         bot.loop.create_task(start_webserver())
         bot._webserver_started = True
 
     print(f"Logged in as {bot.user}")
 
-    # Instant sync to your test guild
     guild = discord.Object(id=TEST_GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
     try:
@@ -173,14 +255,13 @@ async def on_message(message: discord.Message):
     if not found:
         return
     links = cfg["links"]
-    author_id = message.author.id
     added = False
     for url in found:
-        if any(l["url"] == url and l["author_id"] == author_id for l in links):
+        if any(l["url"] == url for l in links):
             continue
         links.append({
             "url": url,
-            "author_id": author_id,
+            "author_id": message.author.id,
             "author": str(message.author),
             "message_id": message.id,
         })
@@ -243,24 +324,110 @@ async def setup_status(interaction: discord.Interaction):
     embed.add_field(name="Source channel", value=src, inline=False)
     embed.add_field(name="Panel channel", value=pnl, inline=False)
     embed.add_field(name="Links stored", value=str(len(cfg["links"])), inline=False)
+    embed.add_field(name="Daily limit", value=f"{DAILY_PULL_LIMIT} / user", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@setup_group.command(name="clear", description="Wipe all stored links for this server")
+@setup_group.command(name="clear", description="Wipe all stored links and user history")
 async def setup_clear(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
         return
     cfg = get_guild_config(interaction.guild.id)
     cfg["links"].clear()
+    cfg["user_state"] = {}
     cfg["panel_message"] = None
     save_data(data)
     await interaction.response.defer(ephemeral=True)
     await refresh_panel(interaction.guild)
-    await interaction.followup.send("🗑️ Cleared all links.", ephemeral=True)
+    await interaction.followup.send(
+        "🗑️ Cleared all links and user history.", ephemeral=True
+    )
 
 
-# Register the setup group on the tree
+# ---------- IMPORT COMMAND ----------
+@setup_group.command(name="import", description="Import links from a .txt file (one URL per line)")
+@app_commands.describe(
+    file="A .txt file with one URL per line",
+    password="Import password",
+)
+async def setup_import(
+    interaction: discord.Interaction,
+    file: discord.Attachment,
+    password: str,
+):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+
+    if password != IMPORT_PASSWORD:
+        await interaction.response.send_message("❌ Wrong password.", ephemeral=True)
+        return
+
+    if not file.filename.lower().endswith(".txt"):
+        await interaction.response.send_message(
+            "❌ Only `.txt` files are supported.", ephemeral=True
+        )
+        return
+
+    if file.size > 2 * 1024 * 1024:  # 2 MB safety cap
+        await interaction.response.send_message(
+            "❌ File too large (max 2 MB).", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        raw = await file.read()
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Could not read file: `{e}`", ephemeral=True)
+        return
+
+    cfg = get_guild_config(interaction.guild.id)
+    links = cfg["links"]
+    existing = {l["url"] for l in links}
+
+    added = 0
+    duplicates = 0
+    invalid = 0
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Extract any URL(s) on the line; keeps only valid http(s) URLs
+        matches = URL_REGEX.findall(line)
+        if not matches:
+            invalid += 1
+            continue
+        for url in matches:
+            if url in existing:
+                duplicates += 1
+                continue
+            links.append({
+                "url": url,
+                "author_id": interaction.user.id,
+                "author": f"imported by {interaction.user}",
+                "message_id": 0,
+            })
+            existing.add(url)
+            added += 1
+
+    save_data(data)
+    await refresh_panel(interaction.guild)
+
+    await interaction.followup.send(
+        f"✅ Import complete.\n"
+        f"• Added: **{added}**\n"
+        f"• Duplicates skipped: **{duplicates}**\n"
+        f"• Invalid lines: **{invalid}**\n"
+        f"• Total pool now: **{len(links)}**",
+        ephemeral=True,
+    )
+
+
 tree.add_command(setup_group)
 
 
