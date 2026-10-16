@@ -7,7 +7,8 @@ import os
 import random
 
 # ---------- CONFIG ----------
-TOKEN = "YOUR_BOT_TOKEN"
+import os
+TOKEN = os.environ["DISCORD_TOKEN"]
 DATA_FILE = "data.json"
 
 URL_REGEX = re.compile(r"https?://[^\s<>]+")
