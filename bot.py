@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import hmac
 import random
 import datetime
 import discord
@@ -9,12 +10,13 @@ from discord.ext import commands
 from aiohttp import web
 
 # ---------- CONFIG ----------
-TOKEN = os.environ["DISCORD_TOKEN"]
+TOKEN = os.environ.get("DISCORD_TOKEN")
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 TEST_GUILD_ID = 1550297120601542776
 
 DAILY_PULL_LIMIT = 2
-IMPORT_PASSWORD = os.environ.get("IMPORT_PASSWORD", "changeme123")
+# No default on purpose: if IMPORT_PASSWORD isn't set, /setup import stays disabled.
+IMPORT_PASSWORD = os.environ.get("IMPORT_PASSWORD", "")
 
 URL_REGEX = re.compile(r"https?://[^\s<>\)\]]+")
 
@@ -26,9 +28,14 @@ def load_data():
             return json.load(f)
     return {"guilds": {}}
 
+
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
+    # Write to a temp file first so a crash mid-write can't corrupt the real file
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp, DATA_FILE)
+
 
 data = load_data()
 
@@ -69,6 +76,38 @@ def get_user_state(cfg: dict, user_id: int) -> dict:
         state["pull_count"] = 0
 
     return state
+
+
+# ---------- LINK HELPERS ----------
+def extract_urls(text: str) -> list[str]:
+    """Finds every URL in a block of text (trailing punctuation trimmed, duplicates removed, order kept)."""
+    seen = set()
+    urls = []
+    for raw in URL_REGEX.findall(text or ""):
+        url = raw.rstrip(".,;:!?\"'")
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def add_links(cfg: dict, urls: list[str], author_id: int, author: str, message_id: int = 0) -> int:
+    """Adds URLs that aren't already in the pool. Returns how many were actually new."""
+    links = cfg["links"]
+    existing = {l["url"] for l in links}
+    added = 0
+    for url in urls:
+        if url in existing:
+            continue
+        existing.add(url)
+        links.append({
+            "url": url,
+            "author_id": author_id,
+            "author": author,
+            "message_id": message_id,
+        })
+        added += 1
+    return added
 
 
 # ---------- BOT ----------
@@ -197,7 +236,11 @@ async def refresh_panel(guild: discord.Guild) -> discord.Message | None:
             return msg
         except (discord.NotFound, discord.HTTPException):
             cfg["panel_message"] = None
-    msg = await channel.send(embed=embed, view=view)
+    try:
+        msg = await channel.send(embed=embed, view=view)
+    except discord.HTTPException as e:
+        print(f"[panel] could not post panel: {e!r}")
+        return None
     cfg["panel_message"] = msg.id
     save_data(data)
     try:
@@ -218,13 +261,16 @@ async def on_ready():
 
     print(f"Logged in as {bot.user}")
 
-    guild = discord.Object(id=TEST_GUILD_ID)
-    bot.tree.copy_global_to(guild=guild)
-    try:
-        synced = await bot.tree.sync(guild=guild)
-        print(f"Synced {len(synced)} slash command(s) to guild {TEST_GUILD_ID}")
-    except Exception as e:
-        print(f"Slash sync failed: {e}")
+    # on_ready can fire again after a reconnect, so only sync once per run
+    if not getattr(bot, "_synced", False):
+        guild = discord.Object(id=TEST_GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        try:
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} slash command(s) to guild {TEST_GUILD_ID}")
+            bot._synced = True
+        except Exception as e:
+            print(f"Slash sync failed: {e}")
 
 
 @bot.event
@@ -234,17 +280,12 @@ async def on_message(message: discord.Message):
     cfg = get_guild_config(message.guild.id)
     if cfg.get("source_channel") != message.channel.id:
         return
-    found = URL_REGEX.findall(message.content)
-    if not found:
+    urls = extract_urls(message.content)
+    if not urls:
         return
-    links = cfg["links"]
-    for url in found:
-        links.append({
-            "url": url,
-            "author_id": message.author.id,
-            "author": str(message.author),
-            "message_id": message.id,
-        })
+    added = add_links(cfg, urls, message.author.id, str(message.author), message.id)
+    if not added:
+        return  # everything in that message was already stored
     save_data(data)
     await refresh_panel(message.guild)
     try:
@@ -258,43 +299,48 @@ setup_group = app_commands.Group(
     name="setup",
     description="Configure the link collector",
     default_permissions=discord.Permissions(administrator=True),
+    guild_only=True,
 )
 
 
 @setup_group.command(name="source", description="Set the channel to watch for links")
+@app_commands.checks.has_permissions(administrator=True)
 async def setup_source(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this in a server.", ephemeral=True)
-        return
     cfg = get_guild_config(interaction.guild.id)
     cfg["source_channel"] = channel.id
     save_data(data)
     await interaction.response.send_message(
-        f"✅ Source channel set to {channel.mention}.", ephemeral=True
+        f"✅ Source channel set to {channel.mention}.\n"
+        "New links posted there are collected automatically. "
+        "To also collect the links already in the channel, run `/setup scan`.",
+        ephemeral=True,
     )
 
 
 @setup_group.command(name="panel", description="Set the channel where the link panel lives")
+@app_commands.checks.has_permissions(administrator=True)
 async def setup_panel(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this in a server.", ephemeral=True)
-        return
     cfg = get_guild_config(interaction.guild.id)
     cfg["panel_channel"] = channel.id
     cfg["panel_message"] = None
     save_data(data)
     await interaction.response.defer(ephemeral=True)
-    await refresh_panel(interaction.guild)
+    msg = await refresh_panel(interaction.guild)
+    if msg is None:
+        await interaction.followup.send(
+            f"⚠️ Panel channel set to {channel.mention}, but I couldn't post there. "
+            "Check that I can view the channel, send messages and embed links.",
+            ephemeral=True,
+        )
+        return
     await interaction.followup.send(
         f"✅ Panel channel set to {channel.mention}.", ephemeral=True
     )
 
 
 @setup_group.command(name="status", description="Show the current setup")
+@app_commands.checks.has_permissions(administrator=True)
 async def setup_status(interaction: discord.Interaction):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this in a server.", ephemeral=True)
-        return
     cfg = get_guild_config(interaction.guild.id)
     src = f"<#{cfg['source_channel']}>" if cfg.get("source_channel") else "❌ not set"
     pnl = f"<#{cfg['panel_channel']}>" if cfg.get("panel_channel") else "❌ not set"
@@ -307,10 +353,8 @@ async def setup_status(interaction: discord.Interaction):
 
 
 @setup_group.command(name="clear", description="Wipe all stored links and user history")
+@app_commands.checks.has_permissions(administrator=True)
 async def setup_clear(interaction: discord.Interaction):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this in a server.", ephemeral=True)
-        return
     cfg = get_guild_config(interaction.guild.id)
     cfg["links"].clear()
     cfg["user_state"] = {}
@@ -323,6 +367,86 @@ async def setup_clear(interaction: discord.Interaction):
     )
 
 
+# ---------- SCAN CHANNEL HISTORY ----------
+@setup_group.command(
+    name="scan",
+    description="Read the source channel's past messages and store every link found",
+)
+@app_commands.describe(
+    limit="How many recent messages to read (0 = the whole channel)",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_scan(
+    interaction: discord.Interaction,
+    limit: app_commands.Range[int, 0, 1000000] = 0,
+):
+    cfg = get_guild_config(interaction.guild.id)
+    source_id = cfg.get("source_channel")
+    if not source_id:
+        await interaction.response.send_message(
+            "❌ Set a source channel first with `/setup source`.", ephemeral=True
+        )
+        return
+
+    channel = interaction.guild.get_channel(source_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(source_id)
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "❌ I can't find the source channel anymore. Set it again with `/setup source`.",
+                ephemeral=True,
+            )
+            return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    scanned = 0
+    found = 0
+    added = 0
+    try:
+        async for message in channel.history(limit=limit or None, oldest_first=True):
+            scanned += 1
+            if message.author.bot:
+                continue
+            urls = extract_urls(message.content)
+            if not urls:
+                continue
+            found += len(urls)
+            added += add_links(cfg, urls, message.author.id, str(message.author), message.id)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"❌ I can't read the history of {channel.mention}. "
+            "Give me **View Channel** and **Read Message History** there.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as e:
+        print(f"[scan] failed: {e!r}")
+        await interaction.followup.send(
+            "❌ Discord returned an error while reading the channel. Try again in a bit.",
+            ephemeral=True,
+        )
+        return
+
+    save_data(data)
+    await refresh_panel(interaction.guild)
+
+    result = (
+        f"✅ Scanned **{scanned}** message(s) in {channel.mention}.\n"
+        f"Links found: **{found}** | New: **{added}** | Already stored: **{found - added}**\n"
+        f"Total pool now: **{len(cfg['links'])}**"
+    )
+    try:
+        await interaction.followup.send(result, ephemeral=True)
+    except discord.HTTPException:
+        # The interaction expired during a very long scan, so post the result in the channel instead
+        try:
+            await channel.send(result)
+        except discord.HTTPException:
+            pass
+
+
 # ---------- ADD LINKS (paste blob) ----------
 @setup_group.command(
     name="addlinks",
@@ -331,36 +455,24 @@ async def setup_clear(interaction: discord.Interaction):
 @app_commands.describe(
     text="Paste anything containing URLs (one per line, sentences, whatever)",
 )
+@app_commands.checks.has_permissions(administrator=True)
 async def setup_addlinks(interaction: discord.Interaction, text: str):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this in a server.", ephemeral=True)
-        return
-
-    matches = URL_REGEX.findall(text)
-    if not matches:
+    urls = extract_urls(text)
+    if not urls:
         await interaction.response.send_message(
             "❌ No URLs found in that text.", ephemeral=True
         )
         return
 
     cfg = get_guild_config(interaction.guild.id)
-    links = cfg["links"]
-
-    added = 0
-    for url in matches:
-        links.append({
-            "url": url,
-            "author_id": interaction.user.id,
-            "author": f"added by {interaction.user}",
-            "message_id": 0,
-        })
-        added += 1
+    added = add_links(cfg, urls, interaction.user.id, f"added by {interaction.user}")
 
     save_data(data)
     await refresh_panel(interaction.guild)
 
     await interaction.response.send_message(
-        f"✅ Added **{added}** link(s). Total pool now: **{len(links)}**",
+        f"✅ Added **{added}** new link(s) ({len(urls) - added} already stored). "
+        f"Total pool now: **{len(cfg['links'])}**",
         ephemeral=True,
     )
 
@@ -371,16 +483,19 @@ async def setup_addlinks(interaction: discord.Interaction, text: str):
     file="A .txt file with one URL per line",
     password="Import password",
 )
+@app_commands.checks.has_permissions(administrator=True)
 async def setup_import(
     interaction: discord.Interaction,
     file: discord.Attachment,
     password: str,
 ):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not IMPORT_PASSWORD:
+        await interaction.response.send_message(
+            "❌ Importing is disabled: no IMPORT_PASSWORD is set on the bot.", ephemeral=True
+        )
         return
 
-    if password != IMPORT_PASSWORD:
+    if not hmac.compare_digest(password.encode(), IMPORT_PASSWORD.encode()):
         await interaction.response.send_message("❌ Wrong password.", ephemeral=True)
         return
 
@@ -406,23 +521,15 @@ async def setup_import(
         return
 
     cfg = get_guild_config(interaction.guild.id)
-    links = cfg["links"]
-
-    added = 0
-    for url in URL_REGEX.findall(text):
-        links.append({
-            "url": url,
-            "author_id": interaction.user.id,
-            "author": f"imported by {interaction.user}",
-            "message_id": 0,
-        })
-        added += 1
+    urls = extract_urls(text)
+    added = add_links(cfg, urls, interaction.user.id, f"imported by {interaction.user}")
 
     save_data(data)
     await refresh_panel(interaction.guild)
 
     await interaction.followup.send(
-        f"✅ Import complete. Added **{added}**. Total pool now: **{len(links)}**",
+        f"✅ Import complete. Added **{added}** new ({len(urls) - added} already stored). "
+        f"Total pool now: **{len(cfg['links'])}**",
         ephemeral=True,
     )
 
@@ -430,5 +537,25 @@ async def setup_import(
 tree.add_command(setup_group)
 
 
+# ---------- ERROR HANDLING ----------
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "❌ You need the Administrator permission to use this."
+    else:
+        print(f"[command error] {error!r}")
+        msg = "❌ Something went wrong running that command."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 # ---------- RUN ----------
-bot.run(TOKEN)
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("DISCORD_TOKEN environment variable not set.")
+    bot.run(TOKEN)
